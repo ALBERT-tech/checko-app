@@ -308,6 +308,34 @@
         .debug-log.info { color: #2196F3; }
         .debug-log.success { color: #4CAF50; }
         .debug-log.error { color: #f44336; }
+
+        /* Элементы, видимые только при печати */
+        .print-only {
+            display: none;
+        }
+
+        /* Стили для печати */
+        @media print {
+            h1, .form-group, .tabs, .tab-button, #printBtn, #content, #debug-tab {
+                display: none !important;
+            }
+            #info-tab, #report-tab {
+                display: block !important;
+            }
+            .print-only {
+                display: block !important;
+                margin-bottom: 10px;
+            }
+            .result-card {
+                break-inside: avoid;
+                border: 1px solid #ccc;
+            }
+            /* Убираем верхний отступ у первой карточки */
+            #info-tab .result-card:first-of-type,
+            #report-tab .result-card:first-of-type {
+                margin-top: 0;
+            }
+        }
     </style>
 </head>
 <body>
@@ -328,13 +356,13 @@
         </div>
 
         <div class="tabs" id="tabs" style="display: none;">
-            <button class="tab-button active" onclick="switchTab('info')">📋 Информация</button>
-            <button class="tab-button" onclick="switchTab('cases')">⚖️ Судебные дела</button>
+            <button class="tab-button" onclick="switchTab('info')">📋 Общая информация</button>
+            <button class="tab-button" onclick="switchTab('report')">📊 Отчёт</button>
             <button class="tab-button" onclick="switchTab('debug')">🔍 Отладка</button>
         </div>
 
         <div id="info-tab" class="tab-content active"></div>
-        <div id="cases-tab" class="tab-content"></div>
+        <div id="report-tab" class="tab-content"></div>
         <div id="debug-tab" class="tab-content"></div>
         <div id="content"></div>
     </div>
@@ -343,9 +371,20 @@
         const API_KEY = 'QQuLenE1LVuotYiF';
         const API_URL = 'https://api.checko.ru/v2/company';
         const LEGAL_CASES_URL = 'https://api.checko.ru/v2/legal-cases';
+        const FINANCES_URL = 'https://api.checko.ru/v2/finances';
+        const ENFORCEMENTS_URL = 'https://api.checko.ru/v2/enforcements';
         let debugLogs = [];
         let currentINN = '';
         let currentOGRN = '';
+        let currentCompanyData = null; // для использования в печати
+
+        // Данные судов, финансов и исполнительных производств
+        let casesRecords = null;
+        let casesLoaded = false;
+        let financialData = null;
+        let financialsLoaded = false;
+        let enforcementRecords = null;
+        let enforcementsLoaded = false;
 
         function addDebugLog(message, type = 'info') {
             const timestamp = new Date().toLocaleTimeString('ru-RU');
@@ -371,6 +410,10 @@
             return /^\d{10}$|^\d{12}$/.test(cleaned);
         }
 
+        function formatNumber(num) {
+            return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+        }
+
         function switchTab(tabName) {
             document.querySelectorAll('.tab-content').forEach(tab => {
                 tab.classList.remove('active');
@@ -381,10 +424,38 @@
             });
             
             document.getElementById(tabName + '-tab').classList.add('active');
-            event.target.classList.add('active');
             
-            if (tabName === 'cases' && !document.getElementById('cases-tab').innerHTML) {
-                loadLegalCases(currentINN, currentOGRN);
+            // Активируем кнопку по тексту
+            const buttons = document.querySelectorAll('.tab-button');
+            buttons.forEach(btn => {
+                if (tabName === 'info' && btn.textContent.includes('Общая')) {
+                    btn.classList.add('active');
+                } else if (tabName === 'report' && btn.textContent.includes('Отчёт')) {
+                    btn.classList.add('active');
+                } else if (tabName === 'debug' && btn.textContent.includes('Отладка')) {
+                    btn.classList.add('active');
+                }
+            });
+            
+            if (tabName === 'report') {
+                // Загружаем суды, если ещё не загружены
+                if (!casesLoaded) {
+                    loadLegalCases(currentINN, currentOGRN);
+                } else {
+                    renderReportTab();
+                }
+                // Загружаем финансы, если ещё не загружены
+                if (!financialsLoaded) {
+                    loadFinancials(currentOGRN, currentINN);
+                } else {
+                    renderReportTab();
+                }
+                // Загружаем исполнительные производства, если ещё не загружены
+                if (!enforcementsLoaded) {
+                    loadEnforcements(currentOGRN, currentINN);
+                } else {
+                    renderReportTab();
+                }
             }
         }
 
@@ -392,6 +463,15 @@
             const innInput = document.getElementById('inn');
             const inn = innInput.value.trim();
             debugLogs = [];
+
+            // Сброс данных
+            casesRecords = null;
+            casesLoaded = false;
+            financialData = null;
+            financialsLoaded = false;
+            enforcementRecords = null;
+            enforcementsLoaded = false;
+            currentCompanyData = null;
 
             if (!inn) {
                 document.getElementById('content').innerHTML = '<div class="error">⚠️ Пожалуйста, введите ИНН</div>';
@@ -407,7 +487,7 @@
             currentOGRN = '';
             document.getElementById('content').innerHTML = '<div class="loading"><div class="spinner"></div><p>Загрузка данных...</p></div>';
             document.getElementById('info-tab').innerHTML = '';
-            document.getElementById('cases-tab').innerHTML = '';
+            document.getElementById('report-tab').innerHTML = '';
             document.getElementById('debug-tab').innerHTML = '';
             document.getElementById('tabs').style.display = 'flex';
             
@@ -429,11 +509,12 @@
                     return;
                 }
 
-                // Сохраняем ОГРН для поиска дел
+                // Сохраняем ОГРН для поиска дел, финансов и исполнительных производств
                 currentOGRN = data.data.ОГРН || data.data.ОГРНИП || '';
                 addDebugLog(`ОГРН сохранён: ${currentOGRN}`);
 
                 addDebugLog('Данные получены успешно', 'success');
+                currentCompanyData = data.data;
                 displayCompanyInfo(data.data);
                 document.getElementById('content').innerHTML = '';
                 document.getElementById('tabs').style.display = 'flex';
@@ -444,10 +525,118 @@
             }
         }
 
-        async function loadLegalCases(inn, ogrn = '') {
-            const casesTab = document.getElementById('cases-tab');
-            casesTab.innerHTML = '<div class="loading"><div class="spinner"></div><p>Загрузка судебных дел...</p></div>';
+        async function loadFinancials(ogrn, inn) {
+            if (financialsLoaded) return financialData;
+            
+            // Показываем загрузку, если вкладка активна
+            if (document.getElementById('report-tab').classList.contains('active')) {
+                renderReportTab();
+            }
+            
+            try {
+                const params = ogrn ? `ogrn=${ogrn}` : `inn=${inn}`;
+                const url = `${FINANCES_URL}?key=${API_KEY}&${params}`;
+                addDebugLog(`Запрос финансов: ${url}`);
+                
+                const response = await fetch(url);
+                const text = await response.text();
+                const data = JSON.parse(text);
+                
+                addDebugLog(`Финансы получены, статус: ${response.status}`, response.ok ? 'success' : 'error');
+                
+                if (data.meta && data.meta.status === 'error') {
+                    addDebugLog(`Ошибка финансов: ${data.meta.message}`, 'error');
+                    financialData = null;
+                } else {
+                    financialData = data;
+                }
+                financialsLoaded = true;
+                
+                if (document.getElementById('report-tab').classList.contains('active')) {
+                    renderReportTab();
+                }
+                return financialData;
+            } catch (e) {
+                addDebugLog(`Ошибка загрузки финансов: ${e.message}`, 'error');
+                financialsLoaded = true;
+                financialData = null;
+                if (document.getElementById('report-tab').classList.contains('active')) {
+                    renderReportTab();
+                }
+                return null;
+            }
+        }
 
+        async function loadEnforcements(ogrn, inn) {
+            enforcementsLoaded = false;
+            renderReportTab(); // показываем спиннер
+            
+            try {
+                let allRecords = [];
+                const pageSize = 100;
+                let totalPages = 1;
+
+                addDebugLog(`Начинаем загрузку исполнительных производств по ИНН: ${inn}`);
+
+                // Первый запрос
+                const params = ogrn ? `ogrn=${ogrn}` : `inn=${inn}`;
+                const firstUrl = `${ENFORCEMENTS_URL}?key=${API_KEY}&${params}&limit=${pageSize}&page=1`;
+                addDebugLog(`Запрос исполнительных производств - page: 1, limit: ${pageSize}`);
+                addDebugLog(`${firstUrl}`);
+
+                const firstResponse = await fetch(firstUrl);
+                const firstResponseText = await firstResponse.text();
+                const firstData = JSON.parse(firstResponseText);
+                
+                addDebugLog(`HTTP статус: ${firstResponse.status}`, 'info');
+
+                if (firstData.data && firstData.data.СтрВсего) {
+                    totalPages = firstData.data.СтрВсего;
+                    addDebugLog(`Определено ${totalPages} страниц(ы)`, 'success');
+                }
+
+                if (firstData.data && firstData.data.Записи && Array.isArray(firstData.data.Записи)) {
+                    allRecords = allRecords.concat(firstData.data.Записи);
+                    addDebugLog(`✓ Загружено ${firstData.data.Записи.length} записей на странице 1. Всего: ${allRecords.length}`, 'success');
+                }
+
+                // Остальные страницы
+                for (let page = 2; page <= totalPages; page++) {
+                    try {
+                        const url = `${ENFORCEMENTS_URL}?key=${API_KEY}&${params}&limit=${pageSize}&page=${page}`;
+                        addDebugLog(`Запрос исполнительных производств - page: ${page}, limit: ${pageSize}`);
+                        addDebugLog(`${url}`);
+
+                        const response = await fetch(url);
+                        const responseText = await response.text();
+                        const data = JSON.parse(responseText);
+                        
+                        addDebugLog(`HTTP статус: ${response.status}`, 'info');
+
+                        if (data.data && data.data.Записи && Array.isArray(data.data.Записи)) {
+                            allRecords = allRecords.concat(data.data.Записи);
+                            addDebugLog(`✓ Загружено ${data.data.Записи.length} записей на странице ${page}. Всего: ${allRecords.length}`, 'success');
+                        }
+                    } catch (e) {
+                        addDebugLog(`Ошибка при запросе (page ${page}): ${e.message}`, 'error');
+                    }
+                }
+
+                enforcementRecords = allRecords;
+                enforcementsLoaded = true;
+                addDebugLog(`Загрузка исполнительных производств завершена. Всего загружено ${allRecords.length} записей`, 'success');
+            } catch (error) {
+                addDebugLog(`Критическая ошибка при загрузке исполнительных производств: ${error.message}`, 'error');
+                enforcementRecords = [];
+                enforcementsLoaded = true;
+            }
+            renderReportTab();
+        }
+
+        async function loadLegalCases(inn, ogrn = '') {
+            casesLoaded = false;
+            renderReportTab(); // показываем спиннер
+            
             try {
                 let allRecords = [];
                 const pageSize = 100;
@@ -455,33 +644,28 @@
 
                 addDebugLog(`Начинаем загрузку дел постранично по ИНН: ${inn}`);
 
-                // Первый запрос для определения количества страниц
-                try {
-                    const firstUrl = `${LEGAL_CASES_URL}?key=${API_KEY}&inn=${inn}&date_from=2023-01-01&date_to=2025-12-31&page=1&limit=${pageSize}`;
-                    addDebugLog(`Запрос судебных дел - page: 1, limit: ${pageSize}`);
-                    addDebugLog(`${firstUrl}`);
+                // Первый запрос
+                const firstUrl = `${LEGAL_CASES_URL}?key=${API_KEY}&inn=${inn}&date_from=2023-01-01&date_to=2025-12-31&page=1&limit=${pageSize}`;
+                addDebugLog(`Запрос судебных дел - page: 1, limit: ${pageSize}`);
+                addDebugLog(`${firstUrl}`);
 
-                    const firstResponse = await fetch(firstUrl);
-                    const firstResponseText = await firstResponse.text();
-                    const firstData = JSON.parse(firstResponseText);
-                    
-                    addDebugLog(`HTTP статус: ${firstResponse.status}`, 'info');
+                const firstResponse = await fetch(firstUrl);
+                const firstResponseText = await firstResponse.text();
+                const firstData = JSON.parse(firstResponseText);
+                
+                addDebugLog(`HTTP статус: ${firstResponse.status}`, 'info');
 
-                    if (firstData.data && firstData.data.СтрВсего) {
-                        totalPages = firstData.data.СтрВсего;
-                        addDebugLog(`Определено ${totalPages} страниц(ы), всего ${firstData.data.ЗапВсего} записей`, 'success');
-                    }
-
-                    if (firstData.data && firstData.data.Записи && Array.isArray(firstData.data.Записи)) {
-                        allRecords = allRecords.concat(firstData.data.Записи);
-                        addDebugLog(`✓ Загружено ${firstData.data.Записи.length} дел на странице 1. Всего: ${allRecords.length}`, 'success');
-                    }
-
-                } catch (e) {
-                    addDebugLog(`Ошибка при запросе (page 1): ${e.message}`, 'error');
+                if (firstData.data && firstData.data.СтрВсего) {
+                    totalPages = firstData.data.СтрВсего;
+                    addDebugLog(`Определено ${totalPages} страниц(ы), всего ${firstData.data.ЗапВсего} записей`, 'success');
                 }
 
-                // Загрузка остальных страниц
+                if (firstData.data && firstData.data.Записи && Array.isArray(firstData.data.Записи)) {
+                    allRecords = allRecords.concat(firstData.data.Записи);
+                    addDebugLog(`✓ Загружено ${firstData.data.Записи.length} дел на странице 1. Всего: ${allRecords.length}`, 'success');
+                }
+
+                // Остальные страницы
                 for (let page = 2; page <= totalPages; page++) {
                     try {
                         const url = `${LEGAL_CASES_URL}?key=${API_KEY}&inn=${inn}&date_from=2023-01-01&date_to=2025-12-31&page=${page}&limit=${pageSize}`;
@@ -498,28 +682,164 @@
                             allRecords = allRecords.concat(data.data.Записи);
                             addDebugLog(`✓ Загружено ${data.data.Записи.length} дел на странице ${page}. Всего: ${allRecords.length}`, 'success');
                         }
-
                     } catch (e) {
                         addDebugLog(`Ошибка при запросе (page ${page}): ${e.message}`, 'error');
                     }
                 }
 
-                if (allRecords.length === 0) {
-                    addDebugLog('Судебных дел не найдено', 'warning');
-                    casesTab.innerHTML = '<div class="no-data">📋 Судебных дел не найдено</div>';
-                    return;
-                }
-
+                casesRecords = allRecords;
+                casesLoaded = true;
                 addDebugLog(`Загрузка завершена. Всего загружено ${allRecords.length} дел`, 'success');
-                displayLegalCases(allRecords, casesTab);
-
             } catch (error) {
                 addDebugLog(`Критическая ошибка при загрузке судебных дел: ${error.message}`, 'error');
-                casesTab.innerHTML = `<div class="error">❌ Ошибка при загрузке судебных дел: ${error.message}</div>`;
+                casesRecords = [];
+                casesLoaded = true;
             }
+            renderReportTab();
         }
 
-        function displayLegalCases(records, container) {
+        function renderReportTab() {
+            const tab = document.getElementById('report-tab');
+            // Формируем дату для печати
+            const now = new Date();
+            const dateStr = now.toLocaleString('ru-RU', { 
+                day: 'numeric', month: 'long', year: 'numeric', 
+                hour: '2-digit', minute: '2-digit', second: '2-digit' 
+            });
+            
+            // Отдельная карточка с датой, видимая только при печати
+            let html = `<div class="result-card print-only">
+                <div class="section-title">📅 Дата отчёта</div>
+                <div class="value">${dateStr}</div>
+            </div>`;
+
+            // Блок финансов
+            if (financialsLoaded) {
+                if (financialData && financialData.data) {
+                    html += displayFinancials(financialData);
+                } else {
+                    html += '<div class="warning">❌ Финансовые данные не найдены или недоступны</div>';
+                }
+            } else {
+                html += '<div class="loading"><div class="spinner"></div><p>Загрузка финансовых данных...</p></div>';
+            }
+
+            // Блок исполнительных производств
+            if (enforcementsLoaded) {
+                if (enforcementRecords && enforcementRecords.length > 0) {
+                    html += displayEnforcements(enforcementRecords);
+                } else {
+                    html += '<div class="no-data">📋 Исполнительных производств не найдено</div>';
+                }
+            } else {
+                html += '<div class="loading"><div class="spinner"></div><p>Загрузка исполнительных производств...</p></div>';
+            }
+
+            // Блок судов
+            if (casesLoaded) {
+                if (casesRecords && casesRecords.length > 0) {
+                    html += displayLegalCases(casesRecords);
+                } else {
+                    html += '<div class="no-data">📋 Судебных дел не найдено</div>';
+                }
+            } else {
+                html += '<div class="loading"><div class="spinner"></div><p>Загрузка судебных дел...</p></div>';
+            }
+
+            // Кнопка печати
+            html += '<div style="text-align: center; margin-top: 20px;">';
+            html += '<button id="printBtn" onclick="printReport()" class="no-print">📄 Выгрузить отчёт в PDF</button>';
+            html += '</div>';
+
+            tab.innerHTML = html;
+        }
+
+        function displayEnforcements(records) {
+            // Подсчёт статистики по непогашенным производствам (ОстЗадолж > 0)
+            let count = 0;
+            let totalSum = 0;
+            records.forEach(rec => {
+                const ost = rec.ОстЗадолж;
+                if (ost && ost > 0) {
+                    count++;
+                    totalSum += ost;
+                }
+            });
+
+            let html = '<div class="result-card">';
+            html += '<div class="section-title">⚖️ Исполнительные производства</div>';
+            if (count === 0) {
+                html += '<div class="no-data">Нет непогашенных исполнительных производств</div>';
+            } else {
+                html += `<div class="result-item">
+                    <div class="label">Количество непогашенных</div>
+                    <div class="value">${count}</div>
+                </div>`;
+                html += `<div class="result-item">
+                    <div class="label">Общая сумма непогашенной задолженности</div>
+                    <div class="value">${formatNumber(Math.round(totalSum))} ₽</div>
+                </div>`;
+            }
+            html += '</div>';
+            return html;
+        }
+
+        function displayFinancials(finData) {
+            const data = finData.data;
+            if (!data) return '<div class="warning">Нет данных о финансах</div>';
+            
+            // Получаем все годы, сортируем по возрастанию, берём последние 3
+            const years = Object.keys(data)
+                .filter(y => /^\d{4}$/.test(y))
+                .map(Number)
+                .sort((a, b) => a - b)
+                .slice(-3);
+            
+            if (years.length === 0) return '<div class="warning">Нет данных за последние годы</div>';
+            
+            let html = '<div class="result-card">';
+            html += '<div class="section-title">💰 Финансовые показатели</div>';
+            html += '<table>';
+            html += '<thead><tr><th>Показатель</th>';
+            years.forEach(year => {
+                html += `<th class="year-cell">${year}</th>`;
+            });
+            html += '</tr></thead>';
+            html += '<tbody>';
+            
+            // Валовая прибыль (2110)
+            html += '<tr>';
+            html += '<td>Валовая прибыль (2110)</td>';
+            years.forEach(year => {
+                const val = data[year] && data[year]['2110'] ? data[year]['2110'] : null;
+                html += `<td class="count-cell">${val !== null ? formatNumber(val) : '—'}</td>`;
+            });
+            html += '</tr>';
+            
+            // Чистая прибыль (2400)
+            html += '<tr>';
+            html += '<td>Чистая прибыль (2400)</td>';
+            years.forEach(year => {
+                const val = data[year] && data[year]['2400'] ? data[year]['2400'] : null;
+                html += `<td class="count-cell">${val !== null ? formatNumber(val) : '—'}</td>`;
+            });
+            html += '</tr>';
+            
+            html += '</tbody></table>';
+            
+            // Уставный капитал за последний год (1310)
+            const latestYear = years[years.length - 1]; // последний (самый новый)
+            const cap = latestYear && data[latestYear] && data[latestYear]['1310'] ? data[latestYear]['1310'] : null;
+            html += '<div style="margin-top: 16px;">';
+            html += '<div class="label">Уставный капитал (на последнюю отчётную дату)</div>';
+            html += `<div class="value">${cap !== null ? formatNumber(cap) + ' ₽' : '—'}</div>`;
+            html += '</div>';
+            
+            html += '</div>';
+            return html;
+        }
+
+        function displayLegalCases(records) {
             addDebugLog(`Обработка ${records.length} записей судебных дел`, 'info');
 
             const statistics = {
@@ -529,12 +849,11 @@
 
             let processedCount = 0;
 
-            records.forEach((record, index) => {
+            records.forEach(record => {
                 if (!record.Дата) return;
                 
                 const year = record.Дата.substring(0, 4);
                 
-                // Проверяем, есть ли наша организация в истцах
                 if (record.Ист && Array.isArray(record.Ист)) {
                     const isIstec = record.Ист.some(ist => ist.ИНН === currentINN);
                     if (isIstec && statistics['Истец'][year] !== undefined) {
@@ -543,7 +862,6 @@
                     }
                 }
                 
-                // Проверяем, есть ли наша организация в ответчиках
                 if (record.Ответ && Array.isArray(record.Ответ)) {
                     const isOtvetc = record.Ответ.some(ot => ot.ИНН === currentINN);
                     if (isOtvetc && statistics['Ответчик'][year] !== undefined) {
@@ -556,7 +874,7 @@
             addDebugLog(`Обработано дел: ${processedCount}`, 'success');
 
             let html = '<div class="result-card">';
-            html += '<div class="success">✓ Данные получены успешно</div>';
+            html += '<div class="success">✓ Данные судебных дел получены успешно</div>';
             html += '<div class="divider"></div>';
             
             html += '<table>';
@@ -580,21 +898,7 @@
             html += '</tbody></table>';
             html += '</div>';
 
-            const totalCases = Object.values(statistics).flat().reduce((a, b) => a + b, 0);
-
-            html += '<div class="result-card">';
-            html += '<div class="section-title">📑 Информация о делах</div>';
-            html += `<div class="result-item">
-                <div class="label">Всего дел найдено</div>
-                <div class="value">${totalCases}</div>
-            </div>`;
-            html += `<div class="result-item">
-                <div class="label">Всего записей в выборке</div>
-                <div class="value">${records.length}</div>
-            </div>`;
-            html += '</div>';
-
-            container.innerHTML = html;
+            return html;
         }
 
         function displayCompanyInfo(company) {
@@ -609,7 +913,16 @@
                 addDebugLog('Определён тип: юридическое лицо', 'info');
             }
 
+            // Дата для печати
+            const now = new Date();
+            const dateStr = now.toLocaleString('ru-RU', { 
+                day: 'numeric', month: 'long', year: 'numeric', 
+                hour: '2-digit', minute: '2-digit', second: '2-digit' 
+            });
+
             let html = '<div class="result-card">';
+            // Вставляем дату внутрь карточки, видимую только при печати
+            html += `<div class="print-only" style="margin-bottom: 10px;"><strong>📅 Дата формирования отчёта:</strong> ${dateStr}</div>`;
             html += '<div class="success">✓ Данные получены успешно</div>';
             html += '<div class="divider"></div>';
 
@@ -671,6 +984,37 @@
 
             html += '</div>';
 
+            // Блок руководителя (только для юрлиц)
+            if (!isIP && company.Руковод && company.Руковод.length > 0) {
+                const director = company.Руковод[0]; // обычно первый - директор
+                html += '<div class="result-section">';
+                html += '<div class="section-title">👤 Руководитель</div>';
+                
+                html += `<div class="result-item">
+                    <div class="label">Должность</div>
+                    <div class="value">${escapeHtml(director.НаимДолжн || director.ВидДолжн || 'Руководитель')}</div>
+                </div>`;
+                
+                html += `<div class="result-item">
+                    <div class="label">ФИО</div>
+                    <div class="value">${escapeHtml(director.ФИО)}</div>
+                </div>`;
+                
+                if (director.МассРуковод) {
+                    html += `<div class="result-item">
+                        <div class="label">Признак массового руководителя</div>
+                        <div class="value"><span class="status-badge status-liquidated">Да</span></div>
+                    </div>`;
+                }
+                
+                html += '</div>';
+            }
+
+            // Общий признак массового руководителя (если есть)
+            if (!isIP && company.МассРуковод) {
+                html += '<div class="warning">⚠️ В организации присутствуют массовые руководители</div>';
+            }
+
             if (company.ЮрАдрес && company.ЮрАдрес.АдресРФ) {
                 html += '<div class="result-section">';
                 html += '<div class="section-title">📍 Адрес</div>';
@@ -711,6 +1055,27 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function printReport() {
+            // Временно активируем обе вкладки для печати (на случай, если какая-то неактивна)
+            document.querySelectorAll('.tab-content').forEach(tab => tab.classList.remove('active'));
+            document.getElementById('info-tab').classList.add('active');
+            document.getElementById('report-tab').classList.add('active');
+            
+            // Запускаем печать
+            window.print();
+            
+            // Восстанавливаем исходное состояние (активируем ту вкладку, которая была активна до печати)
+            const activeButton = document.querySelector('.tab-button.active');
+            if (activeButton) {
+                const tabName = activeButton.textContent.includes('Общая') ? 'info' : 
+                               (activeButton.textContent.includes('Отчёт') ? 'report' : 'debug');
+                switchTab(tabName);
+            } else {
+                // Если по какой-то причине нет активной кнопки, активируем info
+                switchTab('info');
+            }
         }
 
         document.getElementById('inn').addEventListener('keypress', (e) => {
